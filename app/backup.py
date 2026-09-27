@@ -7,9 +7,11 @@ create —— 用 SQLite 在线备份机制（backup API）为 DB_PATH 生成一
     模式，无需 -wal/-shm 伴生文件即可只读打开）与清单 manifest.json
     （记录格式版本、创建时间、各文件 SHA-256 与大小、已执行的校验项）；
   * 先在目标父目录下暂存（.<名称>.staging-*），快照通过 integrity_check、
-    foreign_key_check 与五张业务表结构校验后，才 os.rename 原子发布整个
-    归档目录；
-  * 目标已存在、或与源库路径（含 -wal/-shm/-journal 伴生文件）冲突时拒绝；
+    foreign_key_check 与五张业务表结构校验后，才以原子不覆盖重命名
+    （renameat2 的 RENAME_NOREPLACE）发布整个归档目录——“目标不存在”
+    是重命名成功的原子前提，不存在“检查后又被创建”的竞态窗口；
+  * 目标已存在（含竞争方刚占下的同名目录）、或与源库路径（含
+    -wal/-shm/-journal 伴生文件）冲突时拒绝，绝不动已存在的目标；
   * 任一步失败即清理暂存目录，不改动源库与任何既有归档。
 
 verify —— 只读核验既有归档（不触碰源库，可离线运行）：
@@ -22,9 +24,12 @@ verify —— 只读核验既有归档（不触碰源库，可离线运行）：
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
+import platform
 import shutil
 import sqlite3
 import sys
@@ -144,6 +149,106 @@ def _run_db_checks(db_file: Path) -> list[str]:
     return problems
 
 
+# ---- 原子不覆盖发布 -------------------------------------------------------
+#
+# os.rename 在目标为已存在的空目录时会将其替换，无法在“目标已存在即拒绝”
+# 的语义下使用；这里改用平台原生的不覆盖重命名原语，把“目标不存在”作为
+# 重命名成功的原子前提（Linux: renameat2(RENAME_NOREPLACE)，macOS:
+# renamex_np(RENAME_EXCL)）。平台不支持时宁可报错也绝不退回会覆盖的
+# os.rename。
+
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 0x1
+_RENAME_EXCL = 0x4
+
+# libc 未封装 renameat2（如旧 musl）时直接发系统调用的兜底调用号
+_RENAMEAT2_SYSCALL_NR = {
+    "x86_64": 316,
+    "aarch64": 276,
+    "riscv64": 276,
+    "loongarch64": 276,
+    "armv7l": 382,
+    "i386": 353,
+    "i686": 353,
+    "ppc64": 357,
+    "ppc64le": 357,
+    "s390x": 347,
+}
+
+_rename_noreplace_impl = None  # 惰性定位到的平台原语；False 表示平台不支持
+_rename_noreplace_ready = False
+
+
+def _find_rename_noreplace():
+    """定位平台原生的不覆盖重命名原语；返回调用入口，无支持时返回 None。"""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+
+    renameat2 = getattr(libc, "renameat2", None)  # glibc >= 2.28
+    if renameat2 is not None:
+        renameat2.restype = ctypes.c_int
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+
+        def call(src: bytes, dst: bytes) -> int:
+            return renameat2(_AT_FDCWD, src, _AT_FDCWD, dst, _RENAME_NOREPLACE)
+
+        return call
+
+    if sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is not None:
+            renamex_np.restype = ctypes.c_int
+            renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+
+            def call(src: bytes, dst: bytes) -> int:
+                return renamex_np(src, dst, _RENAME_EXCL)
+
+            return call
+        return None
+
+    if sys.platform.startswith("linux"):
+        nr = _RENAMEAT2_SYSCALL_NR.get(platform.machine())
+        syscall = getattr(libc, "syscall", None)
+        if nr is not None and syscall is not None:
+            syscall.restype = ctypes.c_int
+
+            def call(src: bytes, dst: bytes) -> int:
+                return syscall(nr, _AT_FDCWD, src, _AT_FDCWD, dst, _RENAME_NOREPLACE)
+
+            return call
+    return None
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """原子地把 src 发布为 dst；dst 已存在（含空目录）时失败且不覆盖。"""
+    global _rename_noreplace_impl, _rename_noreplace_ready
+    if not _rename_noreplace_ready:
+        _rename_noreplace_impl = _find_rename_noreplace() or False
+        _rename_noreplace_ready = True
+    if not _rename_noreplace_impl:
+        raise BackupError(
+            "当前平台不支持原子不覆盖重命名（renameat2/renamex_np），拒绝发布归档"
+        )
+    src_b, dst_b = os.fsencode(src), os.fsencode(dst)
+    while True:
+        if _rename_noreplace_impl(src_b, dst_b) == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EINTR:
+            continue
+        if err in (errno.EEXIST, errno.ENOTEMPTY):
+            raise BackupError(f"目标路径已存在，拒绝覆盖: {dst}")
+        raise OSError(err, f"原子发布归档失败: {os.strerror(err)}", str(dst))
+
+
 def create_archive(target: Path) -> dict:
     """创建归档：暂存 -> 校验 -> 原子发布。失败抛 BackupError 并清理暂存。"""
     db_path = Path(config.DB_PATH)
@@ -169,7 +274,7 @@ def create_archive(target: Path) -> dict:
     if not parent.is_dir():
         raise BackupError(f"目标父目录不存在: {parent}")
 
-    # 在目标父目录下暂存，全部校验通过后 os.rename 原子发布（同一文件系统）
+    # 在目标父目录下暂存，全部校验通过后原子不覆盖发布（同一文件系统）
     staging: Path | None = Path(
         tempfile.mkdtemp(prefix=f".{target_resolved.name}.staging-", dir=parent)
     )
@@ -198,10 +303,9 @@ def create_archive(target: Path) -> dict:
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        # 发布前最后确认目标仍未被他人创建，随后同目录 rename 原子生效
-        if os.path.lexists(target_resolved):
-            raise BackupError(f"目标路径在备份期间被创建，拒绝覆盖: {target_resolved}")
-        os.rename(staging, target_resolved)
+        # 原子不覆盖发布：若竞争方已先占目标路径（哪怕是空目录），重命名
+        # 以 EEXIST 失败，对方目录及其内容原样保留，己方暂存由 finally 清理
+        _rename_noreplace(staging, target_resolved)
         staging = None
     finally:
         if staging is not None:

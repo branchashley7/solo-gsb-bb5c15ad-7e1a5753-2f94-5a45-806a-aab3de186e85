@@ -326,9 +326,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   `format` / `format_version`、创建时间、各文件 **SHA-256** 与大小、已执行的
   校验项）。整个归档**先在目标父目录下暂存**，快照通过 `integrity_check`、
   `foreign_key_check` 与**五张业务表**（chains / events / offers /
-  offer_witnesses / chain_seals）**结构校验**后，才以 `rename` **原子发布**整个
-  归档目录；**目标已存在、或与源库路径（含 `-wal` / `-shm` 伴生文件）冲突时
-  拒绝**；任一步失败即清理暂存目录，不改动源库与任何既有归档。
+  offer_witnesses / chain_seals）**结构校验**后，才以**原子不覆盖重命名**
+  （`renameat2` 的 `RENAME_NOREPLACE`）**发布**整个归档目录——“目标不存在”
+  是发布成功的原子前提，竞争方先占到同名路径（哪怕是空目录）时发布失败、
+  对方目录及其内容原样保留；**目标已存在、或与源库路径（含 `-wal` / `-shm`
+  伴生文件）冲突时拒绝**；任一步失败即清理暂存目录，不改动源库与任何既有归档。
 - **`verify <目录>`**：**只读**核验既有归档——解析并校验清单（格式、版本、
   必备条目），逐一重算清单内文件的 SHA-256 并比对大小，拒绝清单之外的文件，
   再对归档内数据库只读执行 `integrity_check`、`foreign_key_check` 与五张业务表
