@@ -7,8 +7,9 @@ create —— 用 SQLite 在线备份机制（backup API）为 DB_PATH 生成一
     模式，无需 -wal/-shm 伴生文件即可只读打开）与清单 manifest.json
     （记录格式版本、创建时间、各文件 SHA-256 与大小、已执行的校验项）；
   * 先在目标父目录下暂存（.<名称>.staging-*），快照通过 integrity_check、
-    foreign_key_check 与五张业务表结构校验后，才 os.rename 原子发布整个
-    归档目录；
+    foreign_key_check 与五张业务表结构校验后，才以**不覆盖**的原子操作发布
+    整个归档目录（Linux 上为 renameat2(RENAME_NOREPLACE)）：目标路径已被
+    其他进程抢先创建时发布失败、保留该目录及其内容，仅清理本进程的暂存目录；
   * 目标已存在、或与源库路径（含 -wal/-shm/-journal 伴生文件）冲突时拒绝；
   * 任一步失败即清理暂存目录，不改动源库与任何既有归档。
 
@@ -22,6 +23,9 @@ verify —— 只读核验既有归档（不触碰源库，可离线运行）：
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
+import errno
 import hashlib
 import json
 import os
@@ -48,6 +52,138 @@ _HEX = frozenset("0123456789abcdef")
 
 class BackupError(Exception):
     """归档操作失败（消息面向操作者，随非零退出码报告）。"""
+
+
+# renameat2 / renameatx_np 使用的目录相对路径文件描述符（Linux/macOS 均为 -100）
+_AT_FDCWD = -100
+
+
+class _NoReplaceUnsupported(Exception):
+    """当前平台/文件系统不支持「不覆盖」的原子重命名，需走可移植回退。"""
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """以「目标不存在才生效」的原子重命名把 src 目录发布为 dst。
+
+    优先使用 Linux renameat2(RENAME_NOREPLACE)（内核 3.15+，本地 ext4/xfs/
+    btrfs/overlayfs 等均支持）：由内核保证「检查不存在」与「重命名生效」是
+    同一个原子操作，dst 已被其他进程创建（哪怕是空目录）时返回 EEXIST，
+    绝不会像 os.rename 那样替换它。glibc 未导出该符号时直接经 syscall 兜底；
+    平台/文件系统不支持则抛 _NoReplaceUnsupported，由调用方走可移植回退。
+
+    其他 OSError（含 EEXIST）按原文向上传播。
+    """
+    if sys.platform.startswith("linux"):
+        libc_name = ctypes.util.find_library("c")
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is not None:
+            renameat2.restype = ctypes.c_int
+            renameat2.argtypes = [
+                ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rc = renameat2(
+                _AT_FDCWD, os.fsencode(str(src)),
+                _AT_FDCWD, os.fsencode(str(dst)),
+                1,  # RENAME_NOREPLACE
+            )
+        else:
+            # 旧 glibc 无 renameat2 封装：直接发 renameat2 系统调用。
+            machine = os.uname().machine
+            syscall_nr = {
+                "x86_64": 316,
+                "aarch64": 38,
+                "ppc64le": 362,
+                "s390x": 349,
+                "riscv64": 276,
+                "i386": 354,
+                "armv7l": 38,
+            }.get(machine)
+            if syscall_nr is None:
+                raise _NoReplaceUnsupported(f"未知架构 {machine} 的 SYS_renameat2 号")
+            syscall_fn = libc.syscall
+            syscall_fn.restype = ctypes.c_long
+            syscall_fn.argtypes = [
+                ctypes.c_long, ctypes.c_int, ctypes.c_char_p,
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+            ]
+            rc = syscall_fn(
+                syscall_nr,
+                _AT_FDCWD, os.fsencode(str(src)),
+                _AT_FDCWD, os.fsencode(str(dst)),
+                1,  # RENAME_NOREPLACE
+            )
+        if rc == 0:
+            return
+        err = ctypes.get_errno()
+        if err in (errno.EINVAL, errno.ENOSYS):
+            # 内核过旧或目标文件系统不支持 RENAME_NOREPLACE（如某些网络 FS）
+            raise _NoReplaceUnsupported(f"renameat2 RENAME_NOREPLACE 不可用: errno {err}")
+        raise OSError(err, os.strerror(err), str(dst))
+    if sys.platform == "darwin":
+        # macOS renameatx_np(RENAME_EXCL)：语义同为「不覆盖」
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        renameatx_np = libc.renameatx_np
+        renameatx_np.restype = ctypes.c_int
+        renameatx_np.argtypes = [
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_ulong,
+        ]
+        rc = renameatx_np(
+            _AT_FDCWD, os.fsencode(str(src)),
+            _AT_FDCWD, os.fsencode(str(dst)),
+            0x00000004,  # RENAME_EXCL
+        )
+        if rc == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EINVAL:
+            raise _NoReplaceUnsupported("renameatx_np RENAME_EXCL 不可用")
+        raise OSError(err, os.strerror(err), str(dst))
+    raise _NoReplaceUnsupported(f"平台 {sys.platform} 无原生不覆盖重命名")
+
+
+def _publish_archive(staging: Path, target: Path) -> None:
+    """把已校验通过的暂存目录发布为目标归档目录，绝不覆盖既有目标。
+
+    首选内核原子的不覆盖重命名（发布瞬间整目录对外可见，目标已被竞争方
+    占住则报 EEXIST，竞争方目录及其内容原样保留）；平台不支持时回退到
+    「mkdir(target) 原子占位（先到者赢）+ 同文件系统硬链接逐文件发布」，
+    回退路径上任何一步失败都清理本进程的半成品目标目录，不触碰竞争方
+    已占住的目录。成功返回后 staging 已不存在。
+    """
+    try:
+        _rename_noreplace(staging, target)
+        return
+    except _NoReplaceUnsupported:
+        pass  # 落到下方可移植回退
+    except FileExistsError as exc:
+        # 竞争方在发布瞬间抢先创建了目标路径（哪怕只是空目录）：
+        # RENAME_NOREPLACE 保证未做任何替换，对方目录原样保留
+        raise BackupError(f"目标路径已被其他进程创建，拒绝覆盖: {target}") from exc
+
+    # 回退：mkdir 是原子的「存在即失败」占位——两个进程并发创建同一目标时
+    # 至多一个 mkdir 成功，竞争落败者立刻报错，不改动对方目录。
+    try:
+        os.mkdir(target)
+    except FileExistsError as exc:
+        raise BackupError(f"目标路径已被其他进程创建，拒绝覆盖: {target}") from exc
+    try:
+        # staging 与 target 同在目标父目录下，硬链接必然在同一文件系统内；
+        # 逐文件 link 完成后再删除暂存，归档内容不变、属性不依赖源文件。
+        for entry in staging.iterdir():
+            os.link(entry, target / entry.name)
+    except OSError as exc:
+        # 只清理本进程刚创建的半成品目录（mkdir 由本进程完成，必为空或仅含
+        # 本进程刚链接进去的文件）；清理失败也不掩盖原始错误。
+        shutil.rmtree(target, ignore_errors=True)
+        raise BackupError(
+            f"归档发布失败（目标 {target} 已清理），拒绝覆盖任何既有路径: {exc}"
+        ) from exc
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _connect_ro(path: Path) -> sqlite3.Connection:
@@ -169,7 +305,7 @@ def create_archive(target: Path) -> dict:
     if not parent.is_dir():
         raise BackupError(f"目标父目录不存在: {parent}")
 
-    # 在目标父目录下暂存，全部校验通过后 os.rename 原子发布（同一文件系统）
+    # 在目标父目录下暂存，全部校验通过后以不覆盖的原子操作发布（同一文件系统）
     staging: Path | None = Path(
         tempfile.mkdtemp(prefix=f".{target_resolved.name}.staging-", dir=parent)
     )
@@ -198,10 +334,9 @@ def create_archive(target: Path) -> dict:
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        # 发布前最后确认目标仍未被他人创建，随后同目录 rename 原子生效
-        if os.path.lexists(target_resolved):
-            raise BackupError(f"目标路径在备份期间被创建，拒绝覆盖: {target_resolved}")
-        os.rename(staging, target_resolved)
+        # 原子的「不覆盖」发布：内核保证目标已存在（含竞争进程恰好创建的
+        # 同名空目录）时失败并保留对方目录，绝不 os.rename 式静默替换
+        _publish_archive(staging, target_resolved)
         staging = None
     finally:
         if staging is not None:
